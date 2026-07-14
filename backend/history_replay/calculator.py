@@ -13,7 +13,8 @@
 import math
 from typing import Optional
 
-from history_replay.strategy_mock import BacktestResult, BarRecord, OrderRecord, PositionRecord
+# 类型契约统一到 strategy_engine.runtime.types（单源），避免两边重复定义
+from strategy_engine.runtime.types import BacktestResult, BarRecord, OrderRecord, PositionRecord
 
 
 # ============================================================

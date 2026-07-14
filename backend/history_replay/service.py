@@ -4,6 +4,7 @@
 K线、信号、交易记录、指标、资金曲线之间逻辑自洽。
 """
 
+import os
 import random
 from datetime import date, timedelta
 from functools import lru_cache
@@ -497,33 +498,55 @@ async def search_stocks(keyword: str, limit: int = 10) -> list[StockOption]:
     return results[:limit]
 
 
-async def list_strategies() -> list[StrategyOption]:
+async def list_strategies(db=None) -> list[StrategyOption]:
     """
     获取可用策略列表
 
-    为什么有这个方法：
-        - 业务角度：回测的核心是"用历史数据验证策略"，用户必须选择一个策略才能启动回测。
-          策略列表让用户看到系统中有哪些可用的量化策略及其简要描述，辅助决策。
-        - 技术角度：前端配置栏的策略下拉框在组件挂载时调用此接口填充选项。
-          策略数据来源于策略引擎模块（strategy_engine），正式实现时需要跨模块调用
-          策略引擎的接口或直接查询策略表。当前 stub 返回 4 个典型策略的 mock 数据。
+    业务角度：
+        - 回测的核心是"用历史数据验证策略"，用户必须选择一个策略才能启动回测。
+          策略列表让用户看到系统中有哪些可用的量化策略及其简要描述。
+        - 默认查询 strategy_engine DB（仅 status='active'），env USE_MOCK_STRATEGY=true
+          时回退到 4 个硬编码 mock。
 
-    参数：无
-        策略列表是全局的，不需要过滤参数。未来可扩展 category 等筛选条件。
+    参数：
+        db: Optional[AsyncSession]。传入则查 DB；不传则返回 mock。
 
     返回值：
         list[StrategyOption]:
-            - 技术含义：StrategyOption 模型的列表，每项包含 id（策略唯一标识）、
-              name（策略名称）、description（策略描述，可选）。
-            - 业务含义：系统中所有可用于回测的量化策略。用户选择某项后，
-              strategy_id 会被传入 start_replay 接口，回测引擎据此加载对应策略逻辑。
+            每项包含 id/name/description。用户选择后 strategy_id 会被传入
+            start_replay 接口，回测引擎据此加载对应策略逻辑。
     """
-    return [
-        StrategyOption(id=1, name="双均线交叉", description="短期均线上穿长期均线买入"),
-        StrategyOption(id=2, name="RSI超买超卖", description="RSI低于30买入，高于70卖出"),
-        StrategyOption(id=3, name="布林带突破", description="价格突破布林带上下轨"),
-        StrategyOption(id=4, name="MACD金叉死叉", description="MACD金叉买入，死叉卖出"),
-    ]
+    # 1. env 兜底 / 无 db 时走 mock
+    use_mock = os.environ.get("USE_MOCK_STRATEGY", "").lower() in ("1", "true", "yes")
+    if use_mock or db is None:
+        return [
+            StrategyOption(id=1, name="双均线交叉", description="短期均线上穿长期均线买入"),
+            StrategyOption(id=2, name="RSI超买超卖", description="RSI低于30买入，高于70卖出"),
+            StrategyOption(id=3, name="布林带突破", description="价格突破布林带上下轨"),
+            StrategyOption(id=4, name="MACD金叉死叉", description="MACD金叉买入，死叉卖出"),
+        ]
+
+    # 2. 默认查 DB（仅 active 策略）
+    try:
+        from strategy_engine.repository import StrategyRepository
+        repo = StrategyRepository(db)
+        strategies = await repo.list_options(status="active")
+        return [
+            StrategyOption(
+                id=s.id,
+                name=s.name,
+                description=s.description or "",
+            )
+            for s in strategies
+        ]
+    except Exception:
+        # DB 不可用时回退到 mock，避免服务挂掉
+        return [
+            StrategyOption(id=1, name="双均线交叉", description="短期均线上穿长期均线买入"),
+            StrategyOption(id=2, name="RSI超买超卖", description="RSI低于30买入，高于70卖出"),
+            StrategyOption(id=3, name="布林带突破", description="价格突破布林带上下轨"),
+            StrategyOption(id=4, name="MACD金叉死叉", description="MACD金叉买入，死叉卖出"),
+        ]
 
 
 async def list_virtual_accounts() -> list[VirtualAccountOption]:
