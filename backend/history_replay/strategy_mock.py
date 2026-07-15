@@ -1,332 +1,41 @@
 """
 模拟策略模块的回测方法返回数据。
 
-本文件模拟调用策略模块内部方法（非HTTP接口）的返回值。
-当策略模块尚未开发完成时，用此 mock 数据提前开发和验证
-我们的指标计算逻辑和报告渲染。
+本文件承担两个职责：
+1. **类型契约 re-export**：BacktestResult / BarRecord / OrderRecord / PositionRecord
+   单源在 strategy_engine.runtime.types，本文件 re-export 便于向后兼容。
+2. **run_backtest_mock**：保留原有纯 Python 模拟实现，作为：
+   - 开发时不需要 DB / 不需要 strategy_engine 模块时的独立测试兜底
+   - 联调阶段设置 USE_MOCK_STRATEGY=true 环境变量可强制走本实现
 
-调用方式（未来替换为真实调用）：
+调用方式：
     from strategy_engine.service import run_backtest
-    result = await run_backtest(stock_code, strategy_id, account_id, timeframe, start_date, end_date)
+    result = await run_backtest(db, stock_code, strategy_id, account_id, timeframe, start_date, end_date)
 
-当前 mock 调用方式：
+    # 仅在需要独立 mock 时使用：
     from history_replay.strategy_mock import run_backtest_mock
     result = await run_backtest_mock(stock_code, strategy_id, account_id, timeframe, start_date, end_date)
+
+    # 强制走 mock：
+    # export USE_MOCK_STRATEGY=true
 """
 
+import os
 import random
 from datetime import date, timedelta
 from typing import Optional
 
-
-# ============================================================
-# 数据结构定义
-# 策略模块方法返回 BacktestResult，包含基础信息 + 逐bar明细
-# 我们基于这些原始数据自行统计所有报告指标
-# ============================================================
-
-class OrderRecord:
-    """
-    单笔订单记录。
-    
-    业务含义：回测过程中发生的一次虚拟交易（买入或卖出）。
-    策略信号触发后，策略模块内部执行模拟撮合产生的成交记录。
-    
-    用途：
-    - 交易详情表的数据源（时间/方向/价格/数量/手续费/盈亏/信号）
-    - 计算胜率：统计 pnl > 0 的卖出订单占比
-    - 计算盈亏比：平均盈利金额 / 平均亏损金额
-    - 计算交易次数：卖出订单数量（一买一卖算一笔完整交易）
-    - 计算总盈亏：所有卖出订单的 pnl 之和
-    """
-
-    def __init__(
-        self,
-        time: str,           # 成交时间，格式 "YYYY-MM-DD"
-                             # 业务含义：这笔交易发生在哪个交易日
-                             # 用途：交易详情表的"时间"列
-
-        side: str,           # 交易方向，"buy" 或 "sell"
-                             # 业务含义：这笔是买入还是卖出
-                             # 用途：交易详情表的"方向"列，买入显示红色、卖出显示绿色（中国惯例）
-
-        price: float,        # 成交价格（每股）
-                             # 业务含义：这笔交易以什么价格成交，回测中通常取当bar收盘价
-                             # 用途：交易详情表的"价格"列
-
-        quantity: int,       # 成交数量（股数）
-                             # 业务含义：买了或卖了多少股，由策略模块内部的仓位管理决定
-                             # 用途：交易详情表的"数量"列
-
-        amount: float,       # 成交金额 = price × quantity
-                             # 业务含义：这笔交易花了或收了多少钱
-                             # 用途：交易详情表的"金额"列
-
-        commission: float,   # 手续费
-                             # 业务含义：券商佣金+印花税等交易成本
-                             # 用途：交易详情表的"手续费"列，也影响盈亏计算的准确性
-
-        pnl: float,          # 盈亏金额（卖出时为该笔卖出的已实现盈亏，买入时为0）
-                             # 业务含义：这笔卖出相比对应买入赚了或亏了多少钱
-                             # 计算方式：(卖出价 - 买入均价) × 数量 - 买入手续费 - 卖出手续费
-                             # 用途：交易详情表的"盈亏"列，正数红色、负数绿色
-                             #      计算胜率：pnl > 0 的卖出算"胜"
-                             #      计算盈亏比：avg(盈利pnl) / |avg(亏损pnl)|
-                             #      计算总盈亏：sum(所有卖出订单的pnl)
-
-        signal: str,         # 触发信号名称，如 "均线金叉"、"RSI超卖"
-                             # 业务含义：是哪个策略信号触发了这笔交易
-                             # 用途：交易详情表的"触发信号"列，日志输出
-    ):
-        self.time = time
-        self.side = side
-        self.price = price
-        self.quantity = quantity
-        self.amount = amount
-        self.commission = commission
-        self.pnl = pnl
-        self.signal = signal
-
-
-class PositionRecord:
-    """
-    单个持仓记录。
-    
-    业务含义：某个交易日收盘时，账户中持有某只股票的详细信息。
-    每个bar结束后，策略模块记录当前持仓状态。
-    
-    用途：
-    - 每日持仓&收益表的数据源
-    - 验证 total_assets = cash + sum(所有持仓的market_value)
-    """
-
-    def __init__(
-        self,
-        stock_code: str,     # 股票代码，如 "000001.SZ"
-                             # 业务含义：持有的是哪只股票
-                             # 用途：每日持仓表的"股票代码"列
-
-        quantity: int,       # 持仓数量（股数）
-                             # 业务含义：当前持有多少股
-                             # 用途：每日持仓表的"持仓数量"列
-
-        cost_price: float,   # 成本价（买入均价）
-                             # 业务含义：这些股票平均每股花了多少钱买入
-                             # 用途：每日持仓表的"成本价"列，计算浮盈的依据
-
-        current_price: float,# 当前价格（当日收盘价）
-                             # 业务含义：这只股票今天值多少钱
-                             # 用途：计算市值和浮盈
-
-        market_value: float, # 市值 = quantity × current_price
-                             # 业务含义：这些股票目前总共值多少钱
-                             # 用途：每日持仓表的"市值"列
-
-        floating_pnl: float, # 浮盈 = market_value - (cost_price × quantity)
-                             # 业务含义：这些股票目前赚了或亏了多少（未实现盈亏）
-                             # 正数表示浮盈，负数表示浮亏
-                             # 用途：每日持仓表的"浮盈"列，正数红色、负数绿色
-    ):
-        self.stock_code = stock_code
-        self.quantity = quantity
-        self.cost_price = cost_price
-        self.current_price = current_price
-        self.market_value = market_value
-        self.floating_pnl = floating_pnl
-
-
-class BarRecord:
-    """
-    单根K线bar的完整记录。
-    
-    业务含义：回测过程中一个时间点（一天/一小时/一分钟）的全部信息。
-    包含行情数据、策略信号、交易记录、持仓状态、账户快照和日志。
-    
-    这是我们统计所有报告指标的核心数据源。
-    """
-
-    def __init__(
-        self,
-        # ── 行情数据 ──
-        time: str,               # 交易日期/时间，格式 "YYYY-MM-DD"
-                                 # 业务含义：这根bar对应哪个交易日
-                                 # 用途：所有图表的X轴时间、交易详情/持仓表的日期列
-
-        open: float,             # 开盘价
-                                 # 业务含义：这个交易时段的第一笔成交价
-                                 # 用途：K线图渲染（回放视图）
-
-        high: float,             # 最高价
-                                 # 业务含义：这个交易时段的最高成交价
-                                 # 用途：K线图渲染
-
-        low: float,              # 最低价
-                                 # 业务含义：这个交易时段的最低成交价
-                                 # 用途：K线图渲染
-
-        close: float,            # 收盘价
-                                 # 业务含义：这个交易时段的最后一笔成交价
-                                 # 用途：K线图渲染、模拟撮合的成交价、计算收益率
-                                 #      计算策略日收益率：(当日total_assets/前日total_assets) - 1
-
-        volume: int,             # 成交量（股）
-                                 # 业务含义：这个交易时段总共成交了多少股
-                                 # 用途：K线图成交量柱
-
-        amount: float,           # 成交额（元）
-                                 # 业务含义：这个交易时段总共成交了多少钱
-                                 # 用途：K线图辅助信息
-
-        benchmark_close: float,  # 基准收盘价（如沪深300指数收盘价）
-                                 # 业务含义：市场基准在这个交易时段的收盘价
-                                 # 用途：计算基准收益率：(当日benchmark_close/前日benchmark_close) - 1
-                                 #      计算Alpha：策略超额收益中无法被市场解释的部分
-                                 #      计算Beta：策略收益对市场收益的敏感度
-                                 #      计算信息率：策略超额收益的稳定性
-                                 #      计算基准波动率：基准日收益率标准差 × √252
-                                 #      策略vs基准收益对比图
-
-        # ── 策略信号 ──
-        signal: Optional[str],   # 触发的信号，"buy"/"sell"/None
-                                 # 业务含义：策略引擎在这根bar上产生了什么交易信号
-                                 # None表示无信号，策略建议持有不动
-                                 # 用途：K线图上的买卖标记（红箭头买入/绿箭头卖出）
-
-        signal_reason: Optional[str],  # 信号触发原因，如 "均线金叉"/"RSI超卖"
-                                       # 业务含义：为什么策略触发了这个信号
-                                       # 用途：交易详情表"触发信号"列、日志输出
-
-        # ── 交易记录 ──
-        orders: list,            # 当日订单列表 [OrderRecord]
-                                 # 业务含义：这根bar上执行了哪些交易
-                                 # 无信号无交易时为空列表
-                                 # 用途：交易详情表的完整数据源
-                                 #      计算胜率/盈亏比/交易次数/总盈亏
-
-        # ── 持仓状态 ──
-        positions: list,         # 当日持仓列表 [PositionRecord]
-                                 # 业务含义：这根bar收盘时账户持有哪些股票
-                                 # 空仓时为空列表
-                                 # 用途：每日持仓&收益表的完整数据源
-
-        # ── 账户快照 ──
-        cash: float,             # 现金余额
-                                 # 业务含义：账户中还有多少可用现金
-                                 # 用途：验证 total_assets = cash + sum(持仓市值)
-                                 #      日志记录"现金不足"时的判断依据
-
-        total_assets: float,     # 总资产 = cash + sum(所有持仓的market_value)
-                                 # ★ 最核心字段 ★
-                                 # 业务含义：这个交易时段结束时账户总共值多少钱
-                                 # 用途：计算策略总收益率：(期末total_assets / 期初total_assets) - 1
-                                 #      计算策略日收益率：(当日total_assets / 前日total_assets) - 1
-                                 #      计算最大回撤：max((峰值-谷值)/峰值)
-                                 #      计算夏普比率：(日均收益-无风险) / 日收益标准差
-                                 #      计算索提诺比率：(日均收益-无风险) / 下行标准差
-                                 #      计算策略波动率：日收益率标准差 × √252
-                                 #      生成资金曲线
-                                 #      生成每日盈亏柱状图
-
-        # ── 日志 ──
-        log_entries: list,       # 当日日志条目 [str]
-                                 # 业务含义：回测过程中产生的运行日志
-                                 # 用途：日志输出面板
-    ):
-        self.time = time
-        self.open = open
-        self.high = high
-        self.low = low
-        self.close = close
-        self.volume = volume
-        self.amount = amount
-        self.benchmark_close = benchmark_close
-        self.signal = signal
-        self.signal_reason = signal_reason
-        self.orders = orders
-        self.positions = positions
-        self.cash = cash
-        self.total_assets = total_assets
-        self.log_entries = log_entries
-
-
-class BacktestResult:
-    """
-    策略模块 run_backtest 方法的返回值。
-    
-    业务含义：一次完整回测的结果。包含基础信息 + 逐bar原始明细，
-    不包含任何统计指标——指标由我们模块自行计算。
-    
-    设计原则：
-    - 策略模块只负责"跑策略"和"记录原始数据"
-    - 我们模块负责"统计指标"和"生成报告"
-    - 职责分离，策略模块不需要理解报告需求
-    """
-
-    def __init__(
-        self,
-        # ── 基础信息 ──
-        session_id: str,         # 回测会话ID
-                                 # 业务含义：唯一标识一次回测运行
-                                 # 用途：缓存key、报告页面路由参数
-
-        stock_code: str,         # 股票代码
-                                 # 业务含义：回测的是哪只股票
-                                 # 用途：报告页面标题展示"回测标的：000001.SZ"
-
-        strategy_id: int,        # 策略ID
-                                 # 业务含义：用的是哪个策略
-                                 # 用途：报告页面展示策略信息
-
-        strategy_name: str,      # 策略名称
-                                 # 业务含义：策略的人类可读名称
-                                 # 用途：报告页面标题展示，用户认名字不认ID
-
-        account_id: int,         # 虚拟账户ID
-                                 # 业务含义：用的哪个虚拟账户
-                                 # 用途：报告展示账户信息
-
-        timeframe: str,          # 时间间隔
-                                 # 业务含义：回测的K线周期
-                                 # 用途：报告展示"回测频率：日线"
-
-        start_date: str,         # 起始日期
-                                 # 业务含义：回测从哪天开始
-                                 # 用途：报告展示设置、图表时间轴起点
-
-        end_date: str,           # 结束日期
-                                 # 业务含义：回测到哪天结束
-                                 # 用途：报告展示设置、图表时间轴终点
-
-        total_bars: int,         # 总bar数
-                                 # 业务含义：回测覆盖了多少个交易时段
-                                 # 用途：报告展示"共261个交易日"
-
-        time_elapsed: float,     # 回测耗时（秒）
-                                 # 业务含义：策略跑了多久
-                                 # 用途：报告展示"耗时 2.3s"
-
-        # ── 逐bar明细 ──
-        bars: list,              # 每根bar的完整记录 [BarRecord]
-                                 # ★ 所有指标计算的原始数据源 ★
-                                 # 业务含义：回测过程中每个时间点的完整快照
-                                 # 用途：计算所有指标、生成所有图表、填充所有表格
-    ):
-        self.session_id = session_id
-        self.stock_code = stock_code
-        self.strategy_id = strategy_id
-        self.strategy_name = strategy_name
-        self.account_id = account_id
-        self.timeframe = timeframe
-        self.start_date = start_date
-        self.end_date = end_date
-        self.total_bars = total_bars
-        self.time_elapsed = time_elapsed
-        self.bars = bars
+# === 类型契约 re-export（向后兼容，单源在 strategy_engine.runtime.types） ===
+from strategy_engine.runtime.types import (  # noqa: F401
+    BacktestResult,
+    BarRecord,
+    OrderRecord,
+    PositionRecord,
+)
 
 
 # ============================================================
-# Mock 数据生成
-# 模拟一次完整的回测运行，生成逻辑自洽的数据
+# Mock 数据生成（保留原有实现，仅 USE_MOCK_STRATEGY=true 时使用）
 # ============================================================
 
 def _generate_trading_days(start: str, end: str) -> list[str]:
@@ -458,25 +167,42 @@ async def run_backtest_mock(
     timeframe: str,
     start_date: str,
     end_date: str,
+    db=None,  # Optional[AsyncSession]：传入则走真实引擎，否则走纯 mock
 ) -> BacktestResult:
     """
-    模拟策略模块的 run_backtest 方法。
+    策略回测入口（历史回放模块专用）。
 
-    业务含义：模拟一次完整的回测运行。按照策略逻辑在历史K线上逐bar求值，
-    触发信号时执行模拟撮合，记录每根bar的完整状态。
+    路由逻辑：
+      - 默认行为：调用 strategy_engine.service.run_backtest（真实引擎 + 策略库）
+      - env USE_MOCK_STRATEGY=true：强制走本文件原有纯 Python 模拟
+      - 无 db：回退到纯 Python 模拟（用于单元测试）
 
-    未来替换为真实调用：
-        from strategy_engine.service import run_backtest
-        result = await run_backtest(stock_code, strategy_id, account_id, timeframe, start_date, end_date)
-
-    参数与配置栏一一对应，原样传入：
-        stock_code:   用户选的股票代码，如 "000001.SZ"
-        strategy_id:  用户选的策略ID
-        account_id:   用户选的虚拟账户ID
-        timeframe:    用户选的时间间隔，如 "1d"
-        start_date:   用户选的起始日期
-        end_date:     用户选的结束日期
+    参数：
+        stock_code:   股票代码（如 "000001.SZ"）
+        strategy_id:  策略 ID（对应 strategy 表主键）
+        account_id:   账户 ID
+        timeframe:    K 线周期（如 "1d"）
+        start_date:   起始日期（YYYY-MM-DD）
+        end_date:     结束日期（YYYY-MM-DD）
+        db:           可选 AsyncSession；不传则走 mock 路径
     """
+    # 1. 检查 USE_MOCK_STRATEGY 环境变量
+    use_mock = os.environ.get("USE_MOCK_STRATEGY", "").lower() in ("1", "true", "yes")
+
+    # 2. 默认走真实引擎（需要 db）
+    if not use_mock and db is not None:
+        from strategy_engine.service import run_backtest as real_run_backtest
+        return await real_run_backtest(
+            db=db,
+            stock_code=stock_code,
+            strategy_id=strategy_id,
+            account_id=account_id,
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    # 3. 回退到原有纯 Python 模拟（无 db 或强制 mock 时）
     # 生成交易日历
     trading_days = _generate_trading_days(start_date, end_date)
     if not trading_days:

@@ -105,13 +105,25 @@ async def get_execution_list(
 @router.post("/start", response_model=ApiResponse)
 async def start_execution(payload: StartExecutionRequest, db: AsyncSession = Depends(get_db)):
     """启动策略执行"""
+    # 从 strategy_engine DB 查策略名（env USE_MOCK_STRATEGY=true 时走硬编码 mock）
+    import os
+    use_mock = os.environ.get("USE_MOCK_STRATEGY", "").lower() in ("1", "true", "yes")
+
     strategy_name = f"策略-{payload.strategy_id}"
-    if payload.strategy_id == 1:
-        strategy_name = "双均线策略"
-    elif payload.strategy_id == 2:
-        strategy_name = "MACD策略"
-    elif payload.strategy_id == 3:
-        strategy_name = "布林带策略"
+    if use_mock:
+        # 兼容历史硬编码映射（仅 env 开启时）
+        mock_names = {1: "双均线策略", 2: "MACD策略", 3: "布林带策略"}
+        strategy_name = mock_names.get(payload.strategy_id, strategy_name)
+    else:
+        try:
+            from strategy_engine.repository import StrategyRepository
+            repo = StrategyRepository(db)
+            strategy = await repo.get_by_id(payload.strategy_id)
+            if strategy:
+                strategy_name = strategy.name
+        except Exception:
+            # 查 DB 失败时回退到默认名（不阻塞启动）
+            pass
 
     execution = Execution(
         strategy_id=payload.strategy_id,

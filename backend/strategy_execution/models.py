@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, ForeignKey, JSON
 from sqlalchemy.orm import relationship
-from ._db import Base, TimestampMixin
+from common.database import Base, TimestampMixin
 
 
 class Execution(Base):

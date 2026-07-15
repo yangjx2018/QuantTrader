@@ -35,6 +35,9 @@ yarn.lock
 .mypy_cache/
 .ruff_cache/
 .tox/
+.coverage
+.coverage.*
+htmlcov/
 
 # Go tooling
 bin/
@@ -95,3 +98,4 @@ assets/
 # 本地临时/历史输出
 yjx.md
 docs/yang-jingxi-api-contract.html
+自测操作手册.md

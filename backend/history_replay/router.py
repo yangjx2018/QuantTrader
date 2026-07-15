@@ -18,8 +18,9 @@
   - 回测数据接口：获取回测产生的图表和表格数据
 """
 
-from fastapi import APIRouter
 from __future__ import annotations
+
+from fastapi import APIRouter
 
 from datetime import date, datetime
 from decimal import Decimal
@@ -104,19 +105,19 @@ async def search_stocks_api(req: StockSearchRequest):
 
 
 @router.get("/strategies")
-async def list_strategies_api():
+async def list_strategies_api(db: AsyncSession = Depends(get_db)):
     """
     获取策略列表
 
     业务角度：
       用户在配置栏的"策略选择"下拉框中需要选择一个策略来驱动回测。
       此接口返回当前系统中所有可用的策略，供下拉框渲染选项。
-      策略来源为 strategy_engine 模块，后续对接时从该模块获取。
+      策略来源为 strategy_engine 模块（DB 表 strategy）。
 
     技术角度：
       GET 方法，无请求参数。返回的列表数据量通常较小（几十条策略），
-      不需要分页。service 层目前返回 mock 数据，后续替换为
-      调用 strategy_engine 模块的接口。
+      不需要分页。默认查 strategy_engine DB，env USE_MOCK_STRATEGY=true
+      时回退到 4 个 mock 数据。
 
     参数：
       无
@@ -126,7 +127,7 @@ async def list_strategies_api():
       data 为策略信息列表，每项包含 id（策略ID）、name（策略名称）、
       description（策略描述）字段
     """
-    data = await list_strategies()
+    data = await list_strategies(db)
     return {"success": True, "data": [d.model_dump() for d in data]}
 
 
