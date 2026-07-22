@@ -16,6 +16,29 @@ from .base import DataSourceAdapter
 logger = logging.getLogger(__name__)
 
 
+def _normalize_a_share_code(symbol: str) -> str:
+    """000001.SZ / sh600000 → 纯 6 位代码，供 akshare 使用。"""
+    text = (symbol or "").strip().upper()
+    if not text:
+        return text
+    if "." in text:
+        text = text.split(".", 1)[0]
+    for prefix in ("SH", "SZ", "BJ"):
+        if text.startswith(prefix) and len(text) > len(prefix):
+            text = text[len(prefix) :]
+            break
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits[-6:] if len(digits) >= 6 else digits or text
+
+
+def _normalize_ymd(value: Optional[str], *, default: Optional[str] = None) -> str:
+    """统一成 YYYYMMDD。"""
+    if not value:
+        return default or datetime.now().strftime("%Y%m%d")
+    text = str(value).strip().replace("-", "").replace("/", "")[:8]
+    return text if len(text) == 8 else (default or datetime.now().strftime("%Y%m%d"))
+
+
 class AkshareAdapter(DataSourceAdapter):
     """Akshare 数据源适配器（真实市场数据）"""
 
@@ -26,9 +49,10 @@ class AkshareAdapter(DataSourceAdapter):
 
     async def get_stock_base_info(self, symbol: str) -> dict:
         """获取个股基础信息"""
+        code = _normalize_a_share_code(symbol)
         try:
-            df = ak.stock_info_a_code_name()
-            row = df[df['code'] == symbol]
+            df = await asyncio.to_thread(ak.stock_info_a_code_name)
+            row = df[df['code'] == code]
             if row.empty:
                 return {
                     "symbol": symbol,
@@ -113,14 +137,14 @@ class AkshareAdapter(DataSourceAdapter):
         end_date: Optional[str] = None,
         limit: int = 100,
     ) -> list[dict]:
-        """获取K线数据（带重试机制）"""
-        # 如果没有指定日期范围，默认获取最近 limit 天
-        if not end_date:
-            end_date = datetime.now().strftime("%Y%m%d")
-        if not start_date:
-            start_date = (datetime.now() - timedelta(days=limit * 2)).strftime("%Y%m%d")
+        """获取K线数据（带重试机制）。返回按时间升序。"""
+        code = _normalize_a_share_code(symbol)
+        end_ymd = _normalize_ymd(end_date)
+        if start_date:
+            start_ymd = _normalize_ymd(start_date)
+        else:
+            start_ymd = (datetime.now() - timedelta(days=max(int(limit), 1) * 2)).strftime("%Y%m%d")
 
-        # 转换 timeframe (支持的级别: 1m/5m/15m/30m/1h/1d/1w)
         period_map = {
             "1m": "1",
             "5m": "5",
@@ -135,12 +159,13 @@ class AkshareAdapter(DataSourceAdapter):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                df = ak.stock_zh_a_hist(
-                    symbol=symbol,
+                df = await asyncio.to_thread(
+                    ak.stock_zh_a_hist,
+                    symbol=code,
                     period=period,
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust="qfq"
+                    start_date=start_ymd,
+                    end_date=end_ymd,
+                    adjust="qfq",
                 )
 
                 if df is None or df.empty:
@@ -151,30 +176,44 @@ class AkshareAdapter(DataSourceAdapter):
 
                 klines = []
                 for _, row in df.iterrows():
+                    raw_ts = row["日期"]
+                    if hasattr(raw_ts, "strftime"):
+                        ts = raw_ts
+                    else:
+                        ts = str(raw_ts)
                     klines.append({
                         "symbol": symbol,
                         "timeframe": timeframe,
-                        "timestamp": row['日期'],
-                        "open": float(row['开盘']),
-                        "high": float(row['最高']),
-                        "low": float(row['最低']),
-                        "close": float(row['收盘']),
-                        "volume": float(row['成交量']),
-                        "turnover": float(row.get('成交额', 0)),
+                        "timestamp": ts,
+                        "date": ts if isinstance(ts, str) else ts.strftime("%Y-%m-%d"),
+                        "open": float(row["开盘"]),
+                        "high": float(row["最高"]),
+                        "low": float(row["最低"]),
+                        "close": float(row["收盘"]),
+                        "volume": float(row["成交量"]),
+                        "turnover": float(row.get("成交额", 0) or 0),
+                        "amount": float(row.get("成交额", 0) or 0),
                     })
 
-                # 按时间排序
-                klines.sort(key=lambda x: x["timestamp"], reverse=True)
-                return klines[:limit]
+                # 升序；取最近 limit 根
+                def _ts_key(item: dict):
+                    v = item["timestamp"]
+                    return v if hasattr(v, "toordinal") else str(v)
+
+                klines.sort(key=_ts_key)
+                if limit and len(klines) > limit:
+                    klines = klines[-int(limit) :]
+                return klines
 
             except Exception as e:
-                logger.warning(f"get_kline_data attempt {attempt + 1} failed for {symbol}: {e}")
+                logger.warning(f"get_kline_data attempt {attempt + 1} failed for {symbol}/{code}: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                 else:
                     logger.error(f"get_kline_data failed after {max_retries} attempts")
                     return []
 
+        return []
     async def get_realtime_quote(self, symbol: str) -> dict:
         """获取实时行情（含五档盘口）"""
         try:

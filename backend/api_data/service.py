@@ -168,7 +168,9 @@ class SectorService:
 def create_services(data_source: Optional[DataSourceAdapter] = None):
     """工厂函数：创建服务实例（依赖注入）"""
     if data_source is None:
-        data_source = MockAdapter()
+        from common.dependencies import get_data_source
+
+        data_source = get_data_source()
     return {
         "stock_service": StockService(data_source, None),  # repo稍后注入
         "kline_service": KLineService(data_source, None),
