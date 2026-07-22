@@ -29,8 +29,23 @@ class Settings(BaseSettings):
 
     # 安全
     ENCRYPTION_KEY: str = ""
+    # 非空时启用 X-API-Key 鉴权（保护执行启动/下单等写接口）
+    API_KEY: str = ""
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # 行情数据源：akshare（真实） / mock（模拟）
+    MARKET_DATA_SOURCE: str = "akshare"
+
+    # 策略执行实盘下单：默认不等待人工验证码（失败快返回），避免阻塞 worker
+    LIVE_WAIT_MANUAL_CAPTCHA: bool = False
+    LIVE_MANUAL_CAPTCHA_TIMEOUT: int = 30
+    # 实盘下单放入后台任务，不阻塞其它策略 tick
+    LIVE_ORDER_ASYNC: bool = True
+
+    model_config = {
+        "env_file": str(ROOT_DIR / ".env"),
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+    }
 
     @property
     def DATABASE_URL(self) -> str:
