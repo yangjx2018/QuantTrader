@@ -14,7 +14,8 @@ export default defineConfig({
     port: 5000,
     host: '0.0.0.0',
     proxy: {
-      '/api': {
+      // 必须用 /api/，避免把前端路由 /api-data 误代理到后端导致 404
+      '/api/': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },

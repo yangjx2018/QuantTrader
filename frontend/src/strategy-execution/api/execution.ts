@@ -39,8 +39,13 @@ export function getExecutionDetail(executionId: number) {
   return request.get<ApiResponse<Execution>>(`/execution/${executionId}`)
 }
 
+export function forceExecutionTick(executionId: number) {
+  return request.post(`/execution/${executionId}/tick`)
+}
+
 export function generateMockSignal(executionId: number) {
-  return request.post<ApiResponse<ExecutionSignal>>(`/execution/${executionId}/mock-signal`)
+  // 兼容旧名：已改为真实 tick
+  return forceExecutionTick(executionId)
 }
 
 export function getExecutionSignals(executionId: number, params?: { risk_passed?: boolean; start_date?: string; end_date?: string; page?: number; page_size?: number }) {

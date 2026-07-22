@@ -2,7 +2,7 @@ export interface Execution {
   id: number
   strategy_id: number
   strategy_name: string
-  account_id: string
+  account_id: number
   status: 'running' | 'paused' | 'stopped'
   start_time: string
   end_time?: string
@@ -86,8 +86,12 @@ export interface ExecutionStatus {
 
 export interface StartExecutionRequest {
   strategy_id: number
-  account_id: string
-  params?: Record<string, unknown>
+  account_id: number
+  params?: {
+    symbol?: string
+    timeframe?: string
+    [key: string]: unknown
+  }
 }
 
 export interface ApiResponse<T> {

@@ -17,6 +17,11 @@ const axiosInstance = axios.create({
 
 axiosInstance.interceptors.request.use(
   (config) => {
+    const apiKey = import.meta.env.VITE_API_KEY as string | undefined
+    if (apiKey) {
+      config.headers = config.headers ?? {}
+      config.headers['X-API-Key'] = apiKey
+    }
     return config
   },
   (error) => Promise.reject(error)
@@ -37,8 +42,17 @@ axiosInstance.interceptors.response.use(
     return response.data as any
   },
   (error) => {
+    const status = error?.response?.status
+    const msg =
+      error?.response?.data?.message ||
+      error?.response?.data?.detail?.message ||
+      error?.message ||
+      '请求失败'
     console.error('API Error:', error?.response?.data || error.message)
-    return Promise.reject(error)
+    if (status === 401) {
+      return Promise.reject(new Error(typeof msg === 'string' ? msg : '未授权，请检查 VITE_API_KEY'))
+    }
+    return Promise.reject(error instanceof Error ? error : new Error(String(msg)))
   }
 )
 

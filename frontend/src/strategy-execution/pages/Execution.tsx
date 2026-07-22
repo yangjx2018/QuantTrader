@@ -49,11 +49,13 @@ export default function Execution() {
   const [selectedExecutionId, setSelectedExecutionId] = useState<number | null>(null)
   const [startForm, setStartForm] = useState<StartExecutionRequest>({
     strategy_id: 0,
-    account_id: '',
-    params: {},
+    account_id: 0,
+    params: { symbol: '000001.SZ', timeframe: '1d' },
   })
   const [strategies, setStrategies] = useState<Array<{ id: number; name: string }>>([])
-  const [accounts, setAccounts] = useState<Array<{ id: number; account_code: string; account_name: string }>>([])
+  const [accounts, setAccounts] = useState<
+    Array<{ id: number; account_code: string; account_name: string; account_type?: string }>
+  >([])
 
   const busyText = useMemo(
     () =>
@@ -67,8 +69,9 @@ export default function Execution() {
         stop: '停止策略',
         pause: '暂停策略',
         resume: '恢复策略',
-        signal: '生成信号',
+        signal: '触发策略一轮',
         acknowledge: '确认告警',
+        tick: '执行一轮',
       })[busy || ''] || '',
     [busy]
   )
@@ -141,65 +144,46 @@ export default function Execution() {
   async function refreshStrategies() {
     try {
       const data = await request.get<any>('/strategy/list', { timeout: apiTimeout })
-      if (data) setStrategies(Array.isArray(data) ? data : [])
-    } catch {
-      setStrategies([
-        { id: 1, name: '双均线策略' },
-        { id: 2, name: 'MACD策略' },
-        { id: 3, name: '布林带策略' },
-      ])
+      const list = Array.isArray(data) ? data : Array.isArray(data?.items) ? data.items : []
+      setStrategies(
+        list
+          .filter((s: { status?: string }) => !s.status || s.status === 'active')
+          .map((s: { id: number; name: string }) => ({ id: s.id, name: s.name }))
+      )
+    } catch (e) {
+      setStrategies([])
+      setError((e as Error).message || '加载策略列表失败')
     }
   }
 
   async function refreshAccounts() {
     try {
       const data = await request.get<any>('/account/accounts', { timeout: apiTimeout })
-      if (data) setAccounts(Array.isArray(data) ? data : [])
-    } catch {
-      setAccounts([
-        { id: 1, account_code: 'LIVE_THS_001', account_name: '实盘主账户' },
-        { id: 2, account_code: 'PAPER_001', account_name: '模拟账户' },
-      ])
+      const list = Array.isArray(data) ? data : []
+      setAccounts(
+        list
+          .filter((a: { account_type?: string; status?: string }) =>
+            (a.account_type === 'paper' || a.account_type === 'live') && a.status !== 'archived'
+          )
+          .map((a: { id: number; account_code: string; account_name: string; account_type?: string }) => ({
+            id: a.id,
+            account_code: a.account_code,
+            account_name: a.account_name,
+            account_type: a.account_type,
+          }))
+      )
+    } catch (e) {
+      setAccounts([])
+      setError((e as Error).message || '加载账户列表失败')
     }
   }
 
   async function refreshRiskRules() {
     try {
       const data = await request.get<any>('/execution/risk-rules', { timeout: apiTimeout })
-      if (data) setRiskRules(Array.isArray(data) ? data : [])
+      if (data) setRiskRules(Array.isArray(data) ? data : data?.items || [])
     } catch {
-      setRiskRules([
-        {
-          id: 1,
-          rule_type: 'max_daily_loss',
-          rule_name: '单日最大亏损',
-          enabled: true,
-          params: { threshold: -0.05 },
-          description: '单日亏损超过5%触发',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        },
-        {
-          id: 2,
-          rule_type: 'max_position_size',
-          rule_name: '单票最大仓位',
-          enabled: true,
-          params: { threshold: 0.3 },
-          description: '单只股票仓位不超过30%',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        },
-        {
-          id: 3,
-          rule_type: 'max_drawdown',
-          rule_name: '最大回撤',
-          enabled: true,
-          params: { threshold: -0.15 },
-          description: '回撤超过15%触发',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        },
-      ])
+      setRiskRules([])
     }
   }
 
@@ -224,17 +208,43 @@ export default function Execution() {
 
   async function startExecution(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    const symbol = String(startForm.params?.symbol || '').trim()
     if (!startForm.strategy_id || !startForm.account_id) {
       setError('请选择策略和账户')
       return
     }
+    if (!symbol) {
+      setError('请填写交易标的（如 000001.SZ）')
+      return
+    }
     try {
-      await request.post('/execution/start', startForm, { timeout: apiTimeout })
+      setBusy('start')
+      setError('')
+      await request.post(
+        '/execution/start',
+        {
+          strategy_id: startForm.strategy_id,
+          account_id: Number(startForm.account_id),
+          params: {
+            ...(startForm.params || {}),
+            symbol,
+            timeframe: startForm.params?.timeframe || '1d',
+          },
+        },
+        { timeout: apiTimeout }
+      )
       setShowStartModal(false)
-      setStartForm({ strategy_id: 0, account_id: '', params: {} })
-      await Promise.all([refreshStatus(), refreshExecutions()])
+      setStartForm({
+        strategy_id: 0,
+        account_id: 0,
+        params: { symbol: '000001.SZ', timeframe: '1d' },
+      })
+      setMessage('策略已启动，已接入账户交易链路')
+      await Promise.all([refreshStatus(), refreshExecutions(), refreshSignals()])
     } catch (e) {
       setError((e as Error).message)
+    } finally {
+      setBusy(null)
     }
   }
 
@@ -242,8 +252,8 @@ export default function Execution() {
     try {
       await request.post(`/execution/${id}/stop`, {}, { timeout: apiTimeout })
       await Promise.all([refreshStatus(), refreshExecutions()])
-    } catch {
-      // 忽略错误
+    } catch (e) {
+      setError((e as Error).message)
     }
   }
 
@@ -251,8 +261,8 @@ export default function Execution() {
     try {
       await request.post(`/execution/${id}/pause`, {}, { timeout: apiTimeout })
       await Promise.all([refreshStatus(), refreshExecutions()])
-    } catch {
-      // 忽略错误
+    } catch (e) {
+      setError((e as Error).message)
     }
   }
 
@@ -260,17 +270,18 @@ export default function Execution() {
     try {
       await request.post(`/execution/${id}/resume`, {}, { timeout: apiTimeout })
       await Promise.all([refreshStatus(), refreshExecutions()])
-    } catch {
-      // 忽略错误
+    } catch (e) {
+      setError((e as Error).message)
     }
   }
 
-  async function generateMockSignal(id: number) {
-    const data = await apiCall<ExecutionSignal>('signal', () =>
-      request.post(`/execution/${id}/mock-signal`, {}, { timeout: apiTimeout })
+  async function forceTick(id: number) {
+    const data = await apiCall<Record<string, unknown>>('tick', () =>
+      request.post(`/execution/${id}/tick`, {}, { timeout: apiTimeout })
     )
     if (data) {
-      await Promise.all([refreshStatus(), refreshExecutions(), refreshSignals()])
+      setMessage(`已触发一轮：信号意图 ${(data as { intents?: number }).intents ?? 0}，订单 ${(data as { orders?: unknown[] }).orders?.length ?? 0}`)
+      await Promise.all([refreshStatus(), refreshExecutions(), refreshSignals(), refreshLogs()])
     }
   }
 
@@ -323,7 +334,7 @@ export default function Execution() {
           <div>
             <h1 className="text-xl font-semibold text-on-surface">执行监控</h1>
             <p className="mt-1 text-sm text-on-surface-variant">
-              实时监控策略执行状态、交易信号、风控告警和执行日志。
+              策略引擎 → 风控 → 账户交易（paper 模拟 / live 同花顺）闭环监控。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -361,7 +372,7 @@ export default function Execution() {
               onStop={stopExecution}
               onPause={pauseExecution}
               onResume={resumeExecution}
-              onGenerateSignal={generateMockSignal}
+              onGenerateSignal={forceTick}
               onViewDetail={viewExecutionDetail}
             />
           )}
@@ -721,7 +732,7 @@ function StartExecutionModal({
   onCancel,
 }: {
   strategies: Array<{ id: number; name: string }>
-  accounts: Array<{ id: number; account_code: string; account_name: string }>
+  accounts: Array<{ id: number; account_code: string; account_name: string; account_type?: string }>
   form: StartExecutionRequest
   setForm: React.Dispatch<React.SetStateAction<StartExecutionRequest>>
   busy: boolean
@@ -742,7 +753,7 @@ function StartExecutionModal({
           </button>
         </div>
         <form className="space-y-4" onSubmit={onSubmit}>
-          <Field label="选择策略">
+          <Field label="选择策略（须为 active）">
             <select
               value={form.strategy_id || ''}
               onChange={(e) => setForm({ ...form, strategy_id: Number(e.target.value) })}
@@ -757,21 +768,38 @@ function StartExecutionModal({
               ))}
             </select>
           </Field>
-          <Field label="交易账户">
+          <Field label="交易账户（paper 模拟 / live 实盘）">
             <select
               value={form.account_id || ''}
-              onChange={(e) => setForm({ ...form, account_id: e.target.value })}
+              onChange={(e) => setForm({ ...form, account_id: Number(e.target.value) })}
               className={inputClass}
               required
             >
               <option value="">请选择账户</option>
               {accounts.map((a) => (
-                <option key={a.id} value={String(a.id)}>
-                  {a.account_name} ({a.account_code})
+                <option key={a.id} value={a.id}>
+                  [{a.account_type || '?'}] {a.account_name} ({a.account_code})
                 </option>
               ))}
             </select>
           </Field>
+          <Field label="交易标的">
+            <input
+              value={String(form.params?.symbol || '')}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  params: { ...(form.params || {}), symbol: e.target.value.trim() },
+                })
+              }
+              className={inputClass}
+              placeholder="例如 000001.SZ"
+              required
+            />
+          </Field>
+          <p className="text-xs text-on-surface-variant">
+            启动后将加载策略代码，按最新 K 线跑 handle_data；有信号则经风控后写入对应账户订单（模拟或同花顺实盘）。
+          </p>
           <div className="mt-5 flex justify-end gap-2">
             <button
               type="button"

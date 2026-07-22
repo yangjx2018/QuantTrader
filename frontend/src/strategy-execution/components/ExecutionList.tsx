@@ -116,7 +116,7 @@ export function ExecutionList({
                       <button
                         onClick={() => onGenerateSignal(execution.id)}
                         className="p-2 text-blue-400 hover:bg-blue-500/10 rounded-lg transition-colors"
-                        title="生成模拟信号"
+                        title="立即执行一轮（策略→风控→下单）"
                       >
                         <TrendingUp className="w-4 h-4" />
                       </button>
