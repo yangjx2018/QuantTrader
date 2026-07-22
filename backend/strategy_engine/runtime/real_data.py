@@ -53,14 +53,11 @@ class RealKLineFetcher:
             DataUnavailableError: api_data 服务不可用
         """
         try:
-            # Import api_data service（延迟导入，避免循环依赖）
             from api_data.service import KLineService
             from api_data.repository import KLineRepository
-            from api_data.adapters.mock import MockAdapter
+            from common.dependencies import get_data_source
 
-            # 创建 KLineService 实例（使用 MockAdapter 作为数据源）
-            # TODO: 后续可替换为真实数据源（如 TushareAdapter）
-            adapter = MockAdapter()
+            adapter = get_data_source()
             kline_repo = KLineRepository(self.db)
             kline_service = KLineService(adapter, kline_repo)
 
@@ -70,31 +67,46 @@ class RealKLineFetcher:
                 timeframe=timeframe,
                 start_date=start_date,
                 end_date=end_date,
-                limit=1000,  # 获取足够多的 K 线
+                limit=1000,
             )
 
             if not klines_data:
                 logger.warning(f"No K-line data returned for {stock_code}")
-                # 降级到 mock 数据
                 logger.info("Falling back to MockKLineFetcher")
                 mock_fetcher = MockKLineFetcher()
                 return await mock_fetcher.fetch_klines(stock_code, start_date, end_date, timeframe)
 
-            # 转换为 KBar 格式
+            # 转换为 KBar 格式（兼容 date / timestamp 字段）
             kbars: list[KBar] = []
             for kline_dict in klines_data:
+                raw_time = kline_dict.get("date") or kline_dict.get("timestamp")
+                if hasattr(raw_time, "strftime"):
+                    time_str = raw_time.strftime("%Y-%m-%d")
+                else:
+                    time_str = str(raw_time)[:10]
                 kbar = KBar(
-                    time=kline_dict["date"],
+                    time=time_str,
                     open=float(kline_dict["open"]),
                     high=float(kline_dict["high"]),
                     low=float(kline_dict["low"]),
                     close=float(kline_dict["close"]),
-                    volume=int(kline_dict.get("volume", 0)),
-                    amount=float(kline_dict.get("amount", 0.0)),
+                    volume=int(float(kline_dict.get("volume", 0) or 0)),
+                    amount=float(
+                        kline_dict.get("amount")
+                        or kline_dict.get("turnover")
+                        or 0.0
+                    ),
                 )
                 kbars.append(kbar)
 
-            logger.info(f"Fetched {len(kbars)} K-bars for {stock_code} from api_data")
+            # 确保升序
+            kbars.sort(key=lambda b: b.time)
+            logger.info(
+                "Fetched %s K-bars for %s via %s",
+                len(kbars),
+                stock_code,
+                type(adapter).__name__,
+            )
             return kbars
 
         except Exception as e:

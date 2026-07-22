@@ -95,24 +95,30 @@ class StrategyInstance:
 
 
 def _call_with_timeout(func: Callable, args: tuple, timeout: int) -> Any:
-    """线程 + signal 双重超时保护。
+    """超时保护：Unix 主线程用 SIGALRM；Windows / 非主线程直接调用。
 
-    signal.alarm 仅在主线程生效；线程内执行用 threading.Timer 兜底。
+    Windows 无 signal.SIGALRM，若强行使用会 AttributeError 并中断策略执行。
     """
-    if threading.current_thread() is threading.main_thread():
-        old_handler = signal.getsignal(signal.SIGALRM)
+    sigalrm = getattr(signal, "SIGALRM", None)
+    if (
+        sigalrm is not None
+        and threading.current_thread() is threading.main_thread()
+    ):
+        old_handler = signal.getsignal(sigalrm)
+
+        def _raise_timeout(*_args: object) -> None:
+            raise StrategyTimeoutError(f"hook timeout after {timeout}s")
+
         try:
-            signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(StrategyTimeoutError(
-                f"hook timeout after {timeout}s"
-            )))
+            signal.signal(sigalrm, _raise_timeout)
             signal.alarm(timeout)
             return func(*args)
         finally:
             signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-    else:
-        # 非主线程：降级为无超时
-        return func(*args)
+            signal.signal(sigalrm, old_handler)
+
+    # Windows / 非主线程：无 SIGALRM，直接执行（依赖外层超时或快速失败）
+    return func(*args)
 
 
 class StrategyLoader:

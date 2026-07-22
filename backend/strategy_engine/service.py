@@ -14,10 +14,13 @@ dry-run 与真实回测共用 BacktestEngine，区别：
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 from strategy_engine.exceptions import (
     InvalidStrategyError,

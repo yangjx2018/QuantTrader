@@ -7,7 +7,8 @@
 变更说明（vs 旧 `_db.py`）：
 - 表名保持单数 `strategy` / `strategy_version`（与原设计一致）
 - Strategy 删除冗余字段 entry_rules / exit_rules / risk_rules（DSL 全在 code_content）
-- Strategy 新增 code_content 字段（当前生效代码）
+- Strategy.code_content 不映射为 DB 列：线上 legacy 表可能无该列（RDS LOCK_WRITE 无法 ALTER）。
+  运行时由 repository 从 strategy_version / 内置策略回填到实例属性。
 - 统一使用 common.database.Base/TimestampMixin（不再重复定义 Base/engine/session）
 """
 
@@ -38,11 +39,19 @@ class Strategy(Base, TimestampMixin):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="策略描述")
     status: Mapped[str] = mapped_column(String(16), default="draft", comment="状态：draft/active/archived")
     version: Mapped[str] = mapped_column(String(32), default="1.0.0", comment="当前版本号")
-    code_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="当前生效的 Python 策略代码")
     parameters: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True, comment="默认参数")
     tags: Mapped[Optional[list]] = mapped_column(JSON, nullable=True, comment="标签数组")
     author: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, comment="创建者")
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, comment="是否默认策略")
+
+    # 非 DB 列：由 repository 从 strategy_version / builtin 注入
+    @property
+    def code_content(self) -> Optional[str]:
+        return getattr(self, "_code_content", None)
+
+    @code_content.setter
+    def code_content(self, value: Optional[str]) -> None:
+        self._code_content = value
 
 
 class StrategyVersion(Base, TimestampMixin):
