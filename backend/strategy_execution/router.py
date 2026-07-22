@@ -104,175 +104,198 @@ async def get_execution_list(
 
 @router.post("/start", response_model=ApiResponse)
 async def start_execution(payload: StartExecutionRequest, db: AsyncSession = Depends(get_db)):
-    """启动策略执行"""
-    # 从 strategy_engine DB 查策略名（env USE_MOCK_STRATEGY=true 时走硬编码 mock）
-    import os
-    use_mock = os.environ.get("USE_MOCK_STRATEGY", "").lower() in ("1", "true", "yes")
+    """启动策略执行：校验策略+账户，写入运行态，并注册到后台 Worker。"""
+    from fastapi import HTTPException
 
-    strategy_name = f"策略-{payload.strategy_id}"
-    if use_mock:
-        # 兼容历史硬编码映射（仅 env 开启时）
-        mock_names = {1: "双均线策略", 2: "MACD策略", 3: "布林带策略"}
-        strategy_name = mock_names.get(payload.strategy_id, strategy_name)
-    else:
-        try:
-            from strategy_engine.repository import StrategyRepository
-            repo = StrategyRepository(db)
-            strategy = await repo.get_by_id(payload.strategy_id)
-            if strategy:
-                strategy_name = strategy.name
-        except Exception:
-            # 查 DB 失败时回退到默认名（不阻塞启动）
-            pass
+    from account_trading.repository import AccountTradingRepository
+    from strategy_engine.exceptions import StrategyNotActive, StrategyNotFound
+    from strategy_engine.repository import StrategyRepository
+    from strategy_engine.service import load_strategy
+    from strategy_execution.worker import get_execution_worker
+
+    params = dict(payload.params or {})
+    symbol = str(params.get("symbol") or "").strip()
+    if not symbol:
+        raise HTTPException(status_code=400, detail={"message": "params.symbol 必填（如 000001.SZ）", "type": "invalid_request"})
+
+    try:
+        await load_strategy(db, payload.strategy_id)
+    except StrategyNotFound as exc:
+        raise HTTPException(status_code=404, detail={"message": str(exc), "type": "strategy_not_found"}) from exc
+    except StrategyNotActive as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc), "type": "strategy_not_active"}) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail={"message": f"策略加载失败: {exc}", "type": "strategy_load_error"}) from exc
+
+    strategy_repo = StrategyRepository(db)
+    strategy = await strategy_repo.get_by_id(payload.strategy_id)
+    strategy_name = strategy.name if strategy else f"策略-{payload.strategy_id}"
+
+    account_repo = AccountTradingRepository(db)
+    account = await account_repo.get_account(int(payload.account_id))
+    if account is None:
+        raise HTTPException(status_code=404, detail={"message": f"交易账户不存在: {payload.account_id}", "type": "account_not_found"})
+    if account.account_type not in {"paper", "live"}:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": f"执行仅支持 paper/live 账户，当前为 {account.account_type}", "type": "unsupported_account_type"},
+        )
+    if account.status == "archived":
+        raise HTTPException(status_code=400, detail={"message": "账户已归档，无法用于执行", "type": "account_archived"})
+
+    params.setdefault("timeframe", "1d")
+    params["symbol"] = symbol
 
     execution = Execution(
-        strategy_id=payload.strategy_id,
+        strategy_id=str(payload.strategy_id),
         strategy_name=strategy_name,
-        account_id=payload.account_id,
+        account_id=int(payload.account_id),
         status="running",
         start_time=datetime.now(),
-        params=payload.params,
+        params=params,
     )
     db.add(execution)
-    await db.flush()
+    try:
+        await db.flush()
+        db.add(
+            ExecutionLog(
+                execution_id=execution.id,
+                level="info",
+                category="execution",
+                message=(
+                    f"策略执行已启动: {strategy_name} → 账户#{account.id}({account.account_type}) "
+                    f"标的={symbol}"
+                ),
+                details={"strategy_id": payload.strategy_id, "account_id": account.id, "symbol": symbol},
+            )
+        )
+        await db.commit()
+        await db.refresh(execution)
+    except Exception as exc:
+        await db.rollback()
+        err = str(exc)
+        if "1290" in err or "LOCK_WRITE" in err or "read only" in err.lower():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": "数据库当前只读（LOCK_WRITE），无法启动执行。请解除 RDS 写锁或切换可写库后重试。",
+                    "type": "db_write_locked",
+                },
+            ) from exc
+        raise
 
-    log = ExecutionLog(
-        execution_id=execution.id,
-        level="info",
-        category="execution",
-        message=f"策略执行已启动，策略ID: {payload.strategy_id}",
-    )
-    db.add(log)
+    worker = get_execution_worker()
+    await worker.register(execution)
+    try:
+        tick_summary = await worker.force_tick(execution.id)
+    except Exception as exc:
+        tick_summary = {"error": str(exc)}
+        db.add(
+            ExecutionLog(
+                execution_id=execution.id,
+                level="warning",
+                category="execution",
+                message=f"首轮 tick 未完成: {exc}",
+            )
+        )
+        await db.commit()
 
-    await db.commit()
     await db.refresh(execution)
-    return ok(ExecutionSchema.model_validate(execution), "策略执行已启动")
+    data = ExecutionSchema.model_validate(execution).model_dump()
+    data["first_tick"] = tick_summary
+    return ok(data, "策略执行已启动并接入交易链路")
 
 
-@router.post("/{execution_id}/stop", response_model=ApiResponse)
+@router.post("/{execution_id:int}/stop", response_model=ApiResponse)
 async def stop_execution(execution_id: int, db: AsyncSession = Depends(get_db)):
     """停止策略执行"""
+    from fastapi import HTTPException
+    from strategy_execution.worker import get_execution_worker
+
     execution = await db.get(Execution, execution_id)
     if not execution:
-        return ok(None, "执行实例不存在")
+        raise HTTPException(status_code=404, detail={"message": "执行实例不存在", "type": "not_found"})
 
     execution.status = "stopped"
     execution.end_time = datetime.now()
-
-    log = ExecutionLog(
-        execution_id=execution.id,
-        level="info",
-        category="execution",
-        message="策略执行已停止",
-    )
-    db.add(log)
-
+    db.add(ExecutionLog(execution_id=execution.id, level="info", category="execution", message="策略执行已停止"))
     await db.commit()
     await db.refresh(execution)
+    await get_execution_worker().unregister(execution_id)
     return ok(ExecutionSchema.model_validate(execution), "策略执行已停止")
 
 
-@router.post("/{execution_id}/pause", response_model=ApiResponse)
+@router.post("/{execution_id:int}/pause", response_model=ApiResponse)
 async def pause_execution(execution_id: int, db: AsyncSession = Depends(get_db)):
     """暂停策略执行"""
+    from fastapi import HTTPException
+
     execution = await db.get(Execution, execution_id)
     if not execution:
-        return ok(None, "执行实例不存在")
+        raise HTTPException(status_code=404, detail={"message": "执行实例不存在", "type": "not_found"})
 
     execution.status = "paused"
-
-    log = ExecutionLog(
-        execution_id=execution.id,
-        level="info",
-        category="execution",
-        message="策略执行已暂停",
-    )
-    db.add(log)
-
+    db.add(ExecutionLog(execution_id=execution.id, level="info", category="execution", message="策略执行已暂停"))
     await db.commit()
     await db.refresh(execution)
     return ok(ExecutionSchema.model_validate(execution), "策略执行已暂停")
 
 
-@router.post("/{execution_id}/resume", response_model=ApiResponse)
+@router.post("/{execution_id:int}/resume", response_model=ApiResponse)
 async def resume_execution(execution_id: int, db: AsyncSession = Depends(get_db)):
     """恢复策略执行"""
+    from fastapi import HTTPException
+    from strategy_execution.worker import get_execution_worker
+
     execution = await db.get(Execution, execution_id)
     if not execution:
-        return ok(None, "执行实例不存在")
+        raise HTTPException(status_code=404, detail={"message": "执行实例不存在", "type": "not_found"})
 
     execution.status = "running"
-
-    log = ExecutionLog(
-        execution_id=execution.id,
-        level="info",
-        category="execution",
-        message="策略执行已恢复",
-    )
-    db.add(log)
-
+    db.add(ExecutionLog(execution_id=execution.id, level="info", category="execution", message="策略执行已恢复"))
     await db.commit()
     await db.refresh(execution)
+    await get_execution_worker().register(execution)
     return ok(ExecutionSchema.model_validate(execution), "策略执行已恢复")
 
 
-@router.get("/{execution_id}", response_model=ApiResponse)
+@router.get("/{execution_id:int}", response_model=ApiResponse)
 async def get_execution_detail(execution_id: int, db: AsyncSession = Depends(get_db)):
     """获取执行实例详情"""
+    from fastapi import HTTPException
+
     execution = await db.get(Execution, execution_id)
     if not execution:
-        return ok(None, "执行实例不存在")
+        raise HTTPException(status_code=404, detail={"message": "执行实例不存在", "type": "not_found"})
     return ok(ExecutionSchema.model_validate(execution), "执行详情已获取")
 
 
-@router.post("/{execution_id}/mock-signal", response_model=ApiResponse)
-async def generate_mock_signal(execution_id: int, db: AsyncSession = Depends(get_db)):
-    """生成模拟交易信号"""
+@router.post("/{execution_id:int}/tick", response_model=ApiResponse)
+async def force_execution_tick(execution_id: int, db: AsyncSession = Depends(get_db)):
+    """手动触发一次策略 tick（跑信号并尝试下单）。"""
+    from fastapi import HTTPException
+    from strategy_execution.worker import get_execution_worker
+
     execution = await db.get(Execution, execution_id)
     if not execution:
-        return ok(None, "执行实例不存在")
+        raise HTTPException(status_code=404, detail={"message": "执行实例不存在", "type": "not_found"})
+    if execution.status != "running":
+        raise HTTPException(status_code=400, detail={"message": "仅 running 状态可触发 tick", "type": "invalid_status"})
 
-    import random
-
-    symbols = ["301183", "000001", "600000", "000858", "300750"]
-    names = ["东田微", "平安银行", "浦发银行", "五粮液", "药明康德"]
-    idx = random.randint(0, len(symbols) - 1)
-    direction = random.choice(["buy", "sell"])
-    base_price = random.uniform(20, 200)
-    quantity = random.randint(1, 10) * 100
-
-    signal = ExecutionSignal(
-        execution_id=execution_id,
-        strategy_id=execution.strategy_id,
-        symbol=symbols[idx],
-        symbol_name=names[idx],
-        direction=direction,
-        signal_price=round(base_price, 2),
-        quantity=quantity,
-        order_type="limit",
-        reason="模拟信号生成",
-        risk_passed=True,
-        order_status="submitted",
-    )
-    db.add(signal)
-
-    execution.total_signals += 1
-    execution.total_orders += 1
-
-    log = ExecutionLog(
-        execution_id=execution_id,
-        level="info",
-        category="signal",
-        message=f"生成模拟信号: {symbols[idx]} {direction} {quantity}股 @ {base_price:.2f}",
-    )
-    db.add(log)
-
-    await db.commit()
-    await db.refresh(signal)
-    return ok(ExecutionSignalSchema.model_validate(signal), "模拟信号已生成")
+    try:
+        summary = await get_execution_worker().force_tick(execution_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"message": str(exc), "type": "tick_failed"}) from exc
+    return ok(summary, "已触发策略 tick")
 
 
-@router.get("/{execution_id}/signals", response_model=ApiResponse)
+@router.post("/{execution_id:int}/mock-signal", response_model=ApiResponse)
+async def generate_mock_signal(execution_id: int, db: AsyncSession = Depends(get_db)):
+    """兼容旧接口：改为真实 tick（不再生成随机假信号）。"""
+    return await force_execution_tick(execution_id, db)
+
+
+@router.get("/{execution_id:int}/signals", response_model=ApiResponse)
 async def get_execution_signals(
     execution_id: int,
     risk_passed: bool | None = Query(default=None),
@@ -517,7 +540,7 @@ async def acknowledge_risk_alert(alert_id: int, db: AsyncSession = Depends(get_d
     return ok(RiskAlertSchema.model_validate(alert), "告警已确认")
 
 
-@router.get("/{execution_id}/logs", response_model=ApiResponse)
+@router.get("/{execution_id:int}/logs", response_model=ApiResponse)
 async def get_execution_logs(
     execution_id: int,
     level: str | None = Query(default=None),

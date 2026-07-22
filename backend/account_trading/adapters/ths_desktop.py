@@ -14,6 +14,8 @@ from typing import Any, Literal
 
 import pandas as pd
 
+from ..ths_settings import dialog_poll_seconds, grid_cache_seconds, light_verify, status_probe_timeout_seconds
+
 # Windows 专用模块 - Linux 上条件导入
 if sys.platform == "win32":
     import pywinauto
@@ -113,22 +115,37 @@ class ThsDesktopAdapter:
         self.auto_captcha = os.getenv("THS_AUTO_CAPTCHA", "1").strip().lower() not in {"0", "false", "no"}
         self.app: Application | None = None
         self.main: Any | None = None
+        self._grid_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._last_menu_path: tuple[str, ...] | None = None
 
-    def connect(self) -> None:
+    def connect(self, *, auto_start: bool = True, wait_timeout: int | None = None) -> None:
         self.client_path = self._normalize_client_path(self.client_path)
         if not self.client_path.exists():
             raise FileNotFoundError(f"同花顺交易客户端不存在: {self.client_path}")
 
+        timeout = 30 if wait_timeout is None else max(1, int(wait_timeout))
         self.app = Application(backend="win32")
         try:
             self.app.connect(path=str(self.client_path), timeout=5)
         except ProcessNotFoundError:
+            if not auto_start:
+                raise TradingClientNotReadyError(
+                    "未检测到同花顺交易客户端进程。请先手动打开并登录交易端，或点击「连接」启动。"
+                )
             self.app = Application(backend="win32").start(str(self.client_path))
         except Exception:
+            if not auto_start:
+                raise TradingClientNotReadyError(
+                    "无法连接到同花顺交易客户端。请确认已登录网上股票交易系统后再试。"
+                )
             self.app = Application(backend="win32").start(str(self.client_path))
 
-        self.main = self._wait_for_main_window(timeout_seconds=30)
+        self.main = self._wait_for_main_window(timeout_seconds=timeout)
         self._activate_main_window()
+
+    def connect_probe(self) -> None:
+        """状态探测：不自动启动客户端，短超时失败快返回。"""
+        self.connect(auto_start=False, wait_timeout=status_probe_timeout_seconds())
 
     def _normalize_client_path(self, client_path: Path) -> Path:
         """The trading UI is xiadan.exe even when the user points at the main launcher."""
@@ -175,7 +192,8 @@ class ThsDesktopAdapter:
                 last_error = exc
             time.sleep(0.8)
         raise TradingClientNotReadyError(
-            f"同花顺交易客户端已尝试启动，但 {timeout_seconds} 秒内未发现主窗口。"
+            f"同花顺交易客户端已连接或已尝试启动，但 {timeout_seconds} 秒内未发现主窗口。"
+            "请确认已登录网上股票交易系统后再试。"
         ) from last_error
 
     def _activate_main_window(self) -> None:
@@ -386,6 +404,7 @@ class ThsDesktopAdapter:
         )
 
     def place_order(self, request: ThsOrderRequest) -> dict[str, Any]:
+        self._grid_cache.clear()
         self.switch_menu(["买入[F1]"] if request.side == "buy" else ["卖出[F2]"])
         self.fill_trade_form(request)
         _, main = self.ensure_connected()
@@ -396,7 +415,7 @@ class ThsDesktopAdapter:
         time.sleep(0.8)
 
         action_result = self.handle_pop_dialogs()
-        verification = self.verify_order(request, action_result)
+        verification = self.verify_order(request, action_result, light=light_verify())
         return verification
 
     def cancel_order(self, entrust_no: str | None = None) -> dict[str, Any]:
@@ -487,9 +506,11 @@ class ThsDesktopAdapter:
                     "请先在同花顺交易窗口完成交易密码/验证码登录；登录成功后再点击 Web 端连接。"
                 ) from exc
             if self._switch_by_hotkey(path, sleep_seconds):
+                self._last_menu_path = tuple(path)
                 return
             if self._is_page_ready_for_path(path):
                 time.sleep(sleep_seconds)
+                self._last_menu_path = tuple(path)
                 return
             raise TradingClientNotReadyError(
                 f"无法切换同花顺菜单 {'/'.join(path)}。交易端可能未登录或仍在启动页。"
@@ -499,6 +520,7 @@ class ThsDesktopAdapter:
         except Exception:
             pass
         time.sleep(sleep_seconds)
+        self._last_menu_path = tuple(path)
 
     def _switch_by_hotkey(self, path: list[str], sleep_seconds: float) -> bool:
         target = "/".join(path)
@@ -699,6 +721,13 @@ class ThsDesktopAdapter:
             time.sleep(0.03)
 
     def read_grid(self) -> list[dict[str, Any]]:
+        cache_key = "/".join(self._last_menu_path) if self._last_menu_path else "_default"
+        ttl = grid_cache_seconds()
+        if ttl > 0:
+            cached = self._grid_cache.get(cache_key)
+            if cached and (time.monotonic() - cached[0]) <= ttl:
+                return [dict(row) for row in cached[1]]
+
         _, main = self.ensure_connected()
         self._handle_captcha_dialog_if_present()
         grid = self._find_grid()
@@ -723,14 +752,18 @@ class ThsDesktopAdapter:
             time.sleep(0.3)
         content = self._get_clipboard_table_text()
         if not content.strip():
-            return []
-        df = pd.read_csv(
-            io.StringIO(content),
-            delimiter="\t",
-            dtype=self.GRID_DTYPE,
-            na_filter=False,
-        )
-        return df.to_dict("records")
+            rows: list[dict[str, Any]] = []
+        else:
+            df = pd.read_csv(
+                io.StringIO(content),
+                delimiter="\t",
+                dtype=self.GRID_DTYPE,
+                na_filter=False,
+            )
+            rows = df.to_dict("records")
+        if ttl > 0:
+            self._grid_cache[cache_key] = (time.monotonic(), [dict(row) for row in rows])
+        return rows
 
     def _get_clipboard_table_text(self) -> str:
         try:
@@ -978,7 +1011,7 @@ class ThsDesktopAdapter:
 
     def is_exist_pop_dialog(self) -> bool:
         app, main = self.ensure_connected()
-        time.sleep(0.5)
+        time.sleep(dialog_poll_seconds())
         try:
             return main.wrapper_object() != app.top_window().wrapper_object()
         except Exception:
@@ -998,25 +1031,30 @@ class ThsDesktopAdapter:
         self,
         request: ThsOrderRequest,
         action_result: dict[str, Any],
+        *,
+        light: bool | None = None,
     ) -> dict[str, Any]:
         errors: list[str] = []
         entrust_no = action_result.get("entrust_no")
         orders: list[dict[str, Any]] = []
         trades: list[dict[str, Any]] = []
         balance: dict[str, Any] = {}
+        use_light = light_verify() if light is None else light
 
         try:
             orders = self.get_today_orders()
         except Exception as exc:
             errors.append(f"orders: {type(exc).__name__}: {exc}")
-        try:
-            trades = self.get_today_trades()
-        except Exception as exc:
-            errors.append(f"trades: {type(exc).__name__}: {exc}")
-        try:
-            balance = self.get_balance()
-        except Exception as exc:
-            errors.append(f"balance: {type(exc).__name__}: {exc}")
+
+        if not use_light:
+            try:
+                trades = self.get_today_trades()
+            except Exception as exc:
+                errors.append(f"trades: {type(exc).__name__}: {exc}")
+            try:
+                balance = self.get_balance()
+            except Exception as exc:
+                errors.append(f"balance: {type(exc).__name__}: {exc}")
 
         matched_orders = self._match_rows(orders, request)
         matched_trades = self._match_rows(trades, request)
@@ -1029,6 +1067,7 @@ class ThsDesktopAdapter:
             "matched_trades": matched_trades,
             "balance_after": balance,
             "errors": errors,
+            "light_verify": use_light,
         }
 
     def safe_balance(self) -> dict[str, Any]:

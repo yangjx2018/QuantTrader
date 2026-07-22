@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -10,6 +11,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from .adapters.ths_desktop import CaptchaRequiredError, ThsDesktopAdapter
+from .ths_settings import light_verify, skip_context_status_seconds
 
 
 OrderSide = Literal["buy", "sell"]
@@ -39,16 +41,60 @@ class AccountTradingService:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._logs: list[AutomationLog] = []
+        self._status_cache_lock = threading.Lock()
+        self._status_cache: dict[str, Any] | None = None
+        self._status_cache_at: float = 0.0
+        self._status_cache_path: str | None = None
 
-    def status(self, client_path: str | None = None) -> dict[str, Any]:
-        return self._run("status", client_path, lambda adapter: adapter.status())
+    def status(self, client_path: str | None = None, *, probe: bool = True) -> dict[str, Any]:
+        """probe=True：不自动启动客户端，短超时失败快返回（供状态查询）。"""
+        result = self._run(
+            "status",
+            client_path,
+            lambda adapter: adapter.status(),
+            probe=probe,
+        )
+        self._remember_status(client_path, result)
+        return result
+
+    def get_cached_status(self, client_path: str | None = None) -> dict[str, Any] | None:
+        ttl = skip_context_status_seconds()
+        if ttl <= 0:
+            return None
+        path_key = str(self._resolve_client_path(client_path))
+        with self._status_cache_lock:
+            if not self._status_cache:
+                return None
+            if self._status_cache_path != path_key:
+                return None
+            if (time.monotonic() - self._status_cache_at) > ttl:
+                return None
+            return dict(self._status_cache)
+
+    def invalidate_status_cache(self) -> None:
+        with self._status_cache_lock:
+            self._status_cache = None
+            self._status_cache_at = 0.0
+            self._status_cache_path = None
+
+    def _remember_status(self, client_path: str | None, data: dict[str, Any]) -> None:
+        if not isinstance(data, dict) or not data.get("connected"):
+            return
+        path_key = str(self._resolve_client_path(client_path))
+        with self._status_cache_lock:
+            self._status_cache = dict(data)
+            self._status_cache_at = time.monotonic()
+            self._status_cache_path = path_key
 
     def prepare_trading_workspace(self, client_path: str | None = None) -> dict[str, Any]:
-        return self._run(
+        result = self._run(
             "prepare_trading_workspace",
             client_path,
             lambda adapter: adapter.prepare_trading_workspace(),
+            probe=False,
         )
+        self._remember_status(client_path, result)
+        return result
 
     def balance(
         self,
@@ -204,6 +250,8 @@ class AccountTradingService:
         wait_manual_captcha: bool = True,
         manual_captcha_timeout: int = 180,
     ) -> dict[str, Any]:
+        use_light = light_verify()
+
         def work(adapter: ThsDesktopAdapter) -> dict[str, Any]:
             errors: list[str] = []
             orders: list[dict[str, Any]] = []
@@ -220,20 +268,21 @@ class AccountTradingService:
                 ]
             except Exception as exc:
                 errors.append(f"orders: {type(exc).__name__}: {exc}")
-            try:
-                trades = [
-                    trade
-                    for row in adapter.get_today_trades()
-                    if self._row_has_value(row)
-                    for trade in [self._normalize_trade(row)]
-                    if trade["broker_trade_id"] or trade["symbol"] or trade["quantity"]
-                ]
-            except Exception as exc:
-                errors.append(f"trades: {type(exc).__name__}: {exc}")
-            try:
-                balance = self._normalize_balance(adapter.get_balance())
-            except Exception as exc:
-                errors.append(f"balance: {type(exc).__name__}: {exc}")
+            if not use_light:
+                try:
+                    trades = [
+                        trade
+                        for row in adapter.get_today_trades()
+                        if self._row_has_value(row)
+                        for trade in [self._normalize_trade(row)]
+                        if trade["broker_trade_id"] or trade["symbol"] or trade["quantity"]
+                    ]
+                except Exception as exc:
+                    errors.append(f"trades: {type(exc).__name__}: {exc}")
+                try:
+                    balance = self._normalize_balance(adapter.get_balance())
+                except Exception as exc:
+                    errors.append(f"balance: {type(exc).__name__}: {exc}")
 
             matched_orders = self._match_normalized_orders(orders, entrust_no, symbol, side, price, quantity)
             matched_trades = self._match_normalized_trades(trades, entrust_no, symbol, side, price, quantity)
@@ -249,6 +298,7 @@ class AccountTradingService:
                 "trades": trades,
                 "balance": balance,
                 "errors": errors,
+                "light_verify": use_light,
                 "checked_at": datetime.now().isoformat(timespec="seconds"),
             }
 
@@ -305,6 +355,7 @@ class AccountTradingService:
         *,
         wait_manual_captcha: bool = False,
         manual_captcha_timeout: int = 120,
+        probe: bool = False,
     ) -> Any:
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("同花顺自动化正在执行其他任务，请稍后再试。")
@@ -315,7 +366,10 @@ class AccountTradingService:
                 wait_manual_captcha=wait_manual_captcha,
                 manual_captcha_timeout=manual_captcha_timeout,
             )
-            adapter.connect()
+            if probe:
+                adapter.connect_probe()
+            else:
+                adapter.connect()
             result = work(adapter)
             self._append_log(operation, "success", "操作完成", {"result": result})
             return result
@@ -324,6 +378,8 @@ class AccountTradingService:
             self._append_log(operation, "captcha_required", str(exc), detail)
             raise
         except Exception as exc:
+            if operation == "status":
+                self.invalidate_status_cache()
             self._append_log(operation, "failed", str(exc), {"error_type": type(exc).__name__})
             raise
         finally:

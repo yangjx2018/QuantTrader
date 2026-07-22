@@ -14,6 +14,7 @@ from common.utils.response import ApiResponse
 from .adapters.ths_desktop import CaptchaRequiredError, TradingClientNotReadyError
 from .repository import AccountTradingRepository, _normalize_order_status
 from .service import account_trading_service
+from .ths_settings import skip_post_order_confirm
 
 
 router = APIRouter(prefix="/api/account", tags=["账户与交易"])
@@ -138,6 +139,14 @@ def raise_api_error(exc: Exception) -> None:
                 "type": "trading_client_not_ready",
             },
         ) from exc
+    if isinstance(exc, RuntimeError) and "同花顺自动化正在执行其他任务" in str(exc):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": str(exc),
+                "type": "trading_client_busy",
+            },
+        ) from exc
     raise HTTPException(status_code=500, detail={"message": str(exc), "type": type(exc).__name__}) from exc
 
 
@@ -194,6 +203,8 @@ async def get_account_context(
     db: AsyncSession,
     account_id: int | None = None,
     require_live: bool = False,
+    *,
+    force_status: bool = False,
 ) -> tuple[AccountTradingRepository, Any, dict[str, Any]]:
     repo = AccountTradingRepository(db)
     if account_id:
@@ -207,10 +218,22 @@ async def get_account_context(
         status_data: dict[str, Any] = {}
         if account.account_type == "live":
             client_path = await repo.get_active_client_path(account)
-            status_data = await run_in_threadpool(account_trading_service.status, client_path)
+            cached = None if force_status else account_trading_service.get_cached_status(client_path)
+            if cached:
+                status_data = cached
+                status_data["status_cache_hit"] = True
+            else:
+                status_data = await run_in_threadpool(account_trading_service.status, client_path)
+                status_data["status_cache_hit"] = False
             assert_desktop_account_matches(account, status_data)
     else:
-        status_data = await run_in_threadpool(account_trading_service.status)
+        cached = None if force_status else account_trading_service.get_cached_status(None)
+        if cached:
+            status_data = cached
+            status_data["status_cache_hit"] = True
+        else:
+            status_data = await run_in_threadpool(account_trading_service.status)
+            status_data["status_cache_hit"] = False
         account = await repo.ensure_account(status_data.get("account") or {})
         if require_live and account.account_type != "live":
             raise HTTPException(status_code=400, detail={"message": "未选择账户时只能跟随同花顺实盘账户。", "type": "unsupported_account_type"})
@@ -335,7 +358,9 @@ async def automation_status(
                     "message": "当前选择的是回测账户，交易台手工下单暂不接入回测引擎。",
                 }
                 return ok(with_selected_account_context(data, account), "回测账户已识别")
-            repo, account, data = await get_account_context(db, account_id, require_live=True)
+            repo, account, data = await get_account_context(
+                db, account_id, require_live=True, force_status=True
+            )
             return ok(with_selected_account_context(data, account), "同花顺连接状态已获取")
         data = await run_in_threadpool(account_trading_service.status)
         account = await repo.ensure_account(data.get("account") or {})
@@ -720,54 +745,84 @@ async def place_order(payload: OrderRequest, db: AsyncSession = Depends(get_db))
             "price": str(payload.price),
             "quantity": payload.quantity,
         }
-        try:
-            confirmation = await run_in_threadpool(
-                account_trading_service.confirm_order,
-                entrust_no=confirmation_input["entrust_no"],
-                symbol=payload.symbol,
-                side=payload.side,
-                price=payload.price,
-                quantity=payload.quantity,
-                client_path=client_path,
-                wait_manual_captcha=payload.wait_manual_captcha,
-                manual_captcha_timeout=payload.manual_captcha_timeout,
-            )
+        if skip_post_order_confirm():
+            confirmation = {
+                "confirmed": bool(confirmation_input["entrust_no"] or data.get("matched_orders") or data.get("matched_trades")),
+                "final_status": data.get("status") or ("submitted" if confirmation_input["entrust_no"] else "unconfirmed"),
+                "entrust_no": confirmation_input["entrust_no"],
+                "matched_orders": data.get("matched_orders") or [],
+                "matched_trades": data.get("matched_trades") or [],
+                "orders": data.get("matched_orders") or [],
+                "trades": data.get("matched_trades") or [],
+                "balance": data.get("balance_after") or {},
+                "errors": data.get("errors") or [],
+                "skipped": True,
+                "light_verify": True,
+                "checked_at": None,
+            }
             data["confirmation"] = confirmation
-            await repo.save_order_confirmation(
-                account,
-                confirmation,
-                event_type="order_confirm",
-                event_message="下单后订单确认回查完成",
-            )
-            await repo.save_balance(account, confirmation.get("balance") or {})
             await repo.append_task_step(
                 task,
                 "confirm_order",
-                "success" if confirmation.get("confirmed") else "failed",
+                "success" if confirmation.get("confirmed") else "skipped",
                 confirmation_input,
                 {
                     "confirmed": confirmation.get("confirmed"),
                     "final_status": confirmation.get("final_status"),
-                    "matched_orders": len(confirmation.get("matched_orders") or []),
-                    "matched_trades": len(confirmation.get("matched_trades") or []),
-                    "errors": confirmation.get("errors") or [],
+                    "skipped": True,
+                    "reason": "THS_SKIP_POST_ORDER_CONFIRM",
                 },
-                None if confirmation.get("confirmed") else "订单未能在当日委托或成交中确认",
+                None,
             )
-        except Exception as confirm_exc:
-            data["confirmation"] = {
-                "confirmed": False,
-                "final_status": "confirmation_failed",
-                "errors": [str(confirm_exc)],
-            }
-            await repo.append_task_step(
-                task,
-                "confirm_order",
-                "failed",
-                confirmation_input,
-                data["confirmation"],
-                str(confirm_exc),
-            )
+        else:
+            try:
+                confirmation = await run_in_threadpool(
+                    account_trading_service.confirm_order,
+                    entrust_no=confirmation_input["entrust_no"],
+                    symbol=payload.symbol,
+                    side=payload.side,
+                    price=payload.price,
+                    quantity=payload.quantity,
+                    client_path=client_path,
+                    wait_manual_captcha=payload.wait_manual_captcha,
+                    manual_captcha_timeout=payload.manual_captcha_timeout,
+                )
+                data["confirmation"] = confirmation
+                await repo.save_order_confirmation(
+                    account,
+                    confirmation,
+                    event_type="order_confirm",
+                    event_message="下单后订单确认回查完成",
+                )
+                await repo.save_balance(account, confirmation.get("balance") or {})
+                await repo.append_task_step(
+                    task,
+                    "confirm_order",
+                    "success" if confirmation.get("confirmed") else "failed",
+                    confirmation_input,
+                    {
+                        "confirmed": confirmation.get("confirmed"),
+                        "final_status": confirmation.get("final_status"),
+                        "matched_orders": len(confirmation.get("matched_orders") or []),
+                        "matched_trades": len(confirmation.get("matched_trades") or []),
+                        "errors": confirmation.get("errors") or [],
+                    },
+                    None if confirmation.get("confirmed") else "订单未能在当日委托或成交中确认",
+                )
+            except Exception as confirm_exc:
+                data["confirmation"] = {
+                    "confirmed": False,
+                    "final_status": "confirmation_failed",
+                    "errors": [str(confirm_exc)],
+                }
+                await repo.append_task_step(
+                    task,
+                    "confirm_order",
+                    "failed",
+                    confirmation_input,
+                    data["confirmation"],
+                    str(confirm_exc),
+                )
         await repo.finish_task(task, "success", data)
         return ok(data, "委托流程已执行，请以返回的合同编号、当日委托或成交回报为准")
     except Exception as exc:

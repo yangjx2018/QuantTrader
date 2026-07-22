@@ -1,14 +1,34 @@
 from datetime import datetime
 from typing import Optional, Any
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 
 class ExecutionBase(BaseModel):
     strategy_id: int
     strategy_name: str
-    account_id: str
+    account_id: int
     params: Optional[dict] = None
     remark: Optional[str] = None
+
+    @field_validator("strategy_id", mode="before")
+    @classmethod
+    def coerce_strategy_id(cls, v: Any) -> int:
+        return int(v)
+
+    @field_validator("account_id", mode="before")
+    @classmethod
+    def coerce_account_id(cls, v: Any) -> int:
+        # 历史脏数据可能把 account_code 写入 account_id；列表接口不能因此 500
+        if isinstance(v, bool):
+            raise ValueError("invalid account_id")
+        if isinstance(v, int):
+            return v
+        if v is None:
+            raise ValueError("account_id required")
+        text = str(v).strip()
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return int(text)
+        return 0
 
 
 class ExecutionCreate(ExecutionBase):
@@ -32,8 +52,9 @@ class Execution(ExecutionBase):
     total_pnl: float = 0.0
     total_signals: int = 0
     total_orders: int = 0
-    created_at: datetime
-    updated_at: datetime
+    # DB 表暂无时间戳列，序列化时用 start_time/end_time 兜底
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     @computed_field
     @property
@@ -65,6 +86,12 @@ class Execution(ExecutionBase):
     def current_drawdown(self) -> float:
         return 0.0
 
+    def model_post_init(self, __context: Any) -> None:
+        if self.created_at is None:
+            object.__setattr__(self, "created_at", self.start_time)
+        if self.updated_at is None:
+            object.__setattr__(self, "updated_at", self.end_time or self.start_time)
+
     class Config:
         from_attributes = True
 
@@ -79,6 +106,11 @@ class ExecutionSignalBase(BaseModel):
     quantity: int
     order_type: str = "limit"
     reason: Optional[str] = None
+
+    @field_validator("strategy_id", mode="before")
+    @classmethod
+    def coerce_signal_strategy_id(cls, v: Any) -> int:
+        return int(v)
 
 
 class ExecutionSignalCreate(ExecutionSignalBase):
@@ -266,8 +298,8 @@ class ExecutionLog(ExecutionLogBase):
 
 class StartExecutionRequest(BaseModel):
     strategy_id: int
-    account_id: str
-    params: Optional[dict] = None
+    account_id: int
+    params: Optional[dict] = None  # 至少含 symbol，可选 timeframe/interval_sec
 
 
 class ExecutionStatusResponse(BaseModel):
